@@ -20,6 +20,8 @@
 	init_proto "$@"
 }
 
+FW4=$(command -v fw4)
+
 proto_map_setup() {
 	local cfg="$1"
 	local iface="$2"
@@ -155,19 +157,29 @@ proto_map_setup() {
 				done
 			done
 			allports=${allports%??}
-
-			# SNAT Fix: Create mape table
-			if nft list tables | grep -q "table inet mape"; then
-				nft delete table inet mape
+			if [ -n "$FW4" ]; then
+				# SNAT Fix: Create mape table
+				if nft list tables | grep -q "table inet mape"; then
+					nft delete table inet mape
+				fi
+				nft add table inet mape
+				nft add chain inet mape srcnat { type nat hook postrouting priority 0\; policy accept\; }
+				# SNAT Fix: Create the rules to SNAT to all the ports
+				for proto in icmp tcp udp; do
+					nft add rule inet mape srcnat ip protocol $proto oifname "map-$cfg" snat ip to $(eval "echo \$RULE_${k}_IPV4ADDR") : numgen inc mod $portcount map { $allports }
+				done
+			else
+				# SNAT Fix: fw3 (untested)
+				iptables -t nat -F MAPE_CHAIN 2>/dev/null
+				iptables -t nat -X MAPE_CHAIN 2>/dev/null
+				iptables -t nat -N MAPE_CHAIN
+				iptables -t nat -A POSTROUTING -o "map-$cfg" -j MAPE_CHAIN
+				for proto in icmp tcp udp; do
+        			for port in $(echo "$allports" | sed 's/.*: //g' | tr ',' '\n' | tr -d ' '); do
+            			iptables -t nat -A MAPE_CHAIN -p $proto --sport $port -j SNAT --to-source $(eval "echo \$RULE_${k}_IPV4ADDR"):$port
+        			done
+    			done
 			fi
-			nft add table inet mape
-			nft add chain inet mape srcnat { type nat hook postrouting priority 0\; policy accept\; }
-
-			# SNAT Fix: Create the rules to SNAT to all the ports
-			for proto in icmp tcp udp; do
-				nft add rule inet mape srcnat ip protocol $proto oifname "map-$cfg" snat ip to $(eval "echo \$RULE_${k}_IPV4ADDR") : numgen inc mod $portcount map { $allports }
-			done
-
 	    else
 			# Original SNAT implementation
 			for portset in $(eval "echo \$RULE_${k}_PORTSETS"); do
@@ -213,6 +225,8 @@ proto_map_setup() {
 		proto_add_ipv6_route $(eval "echo \$RULE_${k}_IPV6ADDR") 128
 	  fi
 	json_close_array
+	json_add_string "ipv6addr" "$(eval "echo \$RULE_${k}_IPV6ADDR")"
+	json_add_string "portsets" "$(eval "echo \$RULE_${k}_PORTSETS")"
 	proto_close_data
 
 	proto_send_update "$cfg"
@@ -246,7 +260,13 @@ proto_map_teardown() {
 	esac
 
 	if [ "$snat_fix" = "1" ]; then
-		nft delete table inet mape 2>/dev/null
+		if [ -n "$FW4" ]; then
+			nft delete table inet mape 2>/dev/null
+		else
+			iptables -t nat -D POSTROUTING -o "map-$cfg" -j MAPE_CHAIN 2>/dev/null
+			iptables -t nat -F MAPE_CHAIN 2>/dev/null
+			iptables -t nat -X MAPE_CHAIN 2>/dev/null
+		fi
 	fi
 
 	rm -f /tmp/map-$cfg.rules
